@@ -1,79 +1,207 @@
 import numpy as np
-
 import numpy.typing as npt
 
-from basis_functions import IntegratedLegendrePolynomials
-from mesh import Mesh, MeshY
+from typing import List
+
+from basis_functions import IntegratedLegendrePolynomials, TensorProductIntegratedLegendrePolynomials
+from basis_functions_type import BasisFunctionsType, BasisFunctions1DType, BasisFunctionsNDType, to_tensor_product_type
+from function_evaluation import FunctionEvaluation
+from helpers import are_all_equal
+from mesh import Mesh, TensorProductMesh, Mesh1D, TensorProductMeshND, MeshY, ExtendedTensorProductMesh
 
 
 class Space:
     mesh: Mesh
-    deg: int
+    number_of_dofs: int
+    number_of_dofs_in_element: int
 
-    ndof: int
-    ndof_per_el: int
-    local2global: npt.NDArray[np.int_]
+    basis_functions_type: BasisFunctionsType
+    reference_basis_functions: FunctionEvaluation
+    local2global_dofs: npt.NDArray[np.int_]
 
-    shape_fun_type: str
-    shape_fun: npt.NDArray[np.float_]
-    shape_der: npt.NDArray[np.float_]
-    shape_hess: npt.NDArray[np.float_]
+    # nsh_max (max per element), nsh_dir (max uni-variate per element),
+    # boundary (space of traces), ncomp (scalar, vectorial functions, etc)
+    # deg_per_el: npt.NDArray[np.float_]
 
-    def __init__(self, mesh: Mesh, deg: int = 1, derivatives: tuple[bool, bool, bool] = (True, False, False),
-                 shape_fun_type: str = "IntegratedLegendrePolynomials"):
+
+class TensorProductSpace(Space):
+    mesh: TensorProductMesh
+
+
+class Space1D(TensorProductSpace):
+    mesh: Mesh1D
+    degree: int = 0
+
+    basis_functions_type: BasisFunctions1DType
+
+    def __init__(self, mesh: Mesh1D, degree: int, derivatives_up_to: int = 0,
+                 basis_functions_type: BasisFunctions1DType = BasisFunctions1DType.INTEGRATED_LEGENDRE_POLYNOMIALS):
         self.mesh = mesh
-        self.deg = deg
-        self.shape_fun_type = shape_fun_type
+        self.degree = degree
+        self.number_of_dofs = mesh.number_of_elements * degree + 1
+        self.number_of_dofs_in_element = degree + 1
 
-        self.ndof = self.mesh.nel * self.deg + 1
-        self.ndof_per_el = self.deg + 1
-        self.local2global = self.__compute_local2global()
+        if basis_functions_type not in BasisFunctions1DType:
+            raise ValueError(
+                f"The chosen type of basis function '{basis_functions_type}' has not been implemented. "
+                f"Available types: {', '.join([possible_type.value for possible_type in BasisFunctions1DType])}.")
+        self.basis_functions_type = basis_functions_type
+        self.set_reference_basis_functions(derivatives_up_to=derivatives_up_to)
+        self.set_local2global_dofs()
 
-        self.__compute_shape_fun(derivatives)
+    def set_reference_basis_functions(self, derivatives_up_to: int = 0):
+        basis_functions_class = globals()[self.basis_functions_type.value]
+        basis_functions = basis_functions_class(degree=self.degree)
 
-    def __compute_local2global(self) -> npt.NDArray[np.int_]:
-        local2global = np.empty((self.mesh.nel, self.ndof_per_el))
+        self.reference_basis_functions = basis_functions.evaluate(
+            evaluation_points=self.mesh.quadrature_formula.reference_quadrature_nodes,
+            derivatives_up_to=derivatives_up_to
+        )
+
+    def set_local2global_dofs(self):  # TODO this depends on the basis_functions_type !!
+        local2global_dofs = np.empty((self.mesh.number_of_elements, self.number_of_dofs_in_element), dtype=int)
         global_dof_index = 0
 
-        for iel in range(self.mesh.nel):
-            local2global[iel, :] = np.arange(global_dof_index, global_dof_index + self.ndof_per_el)
-            global_dof_index = global_dof_index + self.deg
+        for element_id in range(self.mesh.number_of_elements):
+            local2global_dofs[element_id, :] = np.arange(global_dof_index, global_dof_index
+                                                         + self.number_of_dofs_in_element)
+            global_dof_index = global_dof_index + self.degree
 
-        return local2global
-
-    def __compute_shape_fun(self, derivatives: tuple[bool, bool, bool] = (True, False, False)):
-        if self.shape_fun_type != "IntegratedLegendrePolynomials":
-            print("""Warning: the chosen type of basis function has not been implemented yet, so it has
-                  been changed to 'IntegratedLegendrePolynomials'.""")
-        basis_fun = IntegratedLegendrePolynomials(deg=self.deg, derivatives=derivatives)
-
-        reference_basis_fun = basis_fun.evaluate(self.mesh.param_gauss_nodes)
-        self.shape_fun = reference_basis_fun["fun"]
-        self.shape_der = reference_basis_fun["der"]
-        self.shape_hess = reference_basis_fun["hess"]
-
-    def stiffness_matrix(self):
-        return NotImplemented  # TODO
-
-    def mass_matrix(self):
-        return NotImplemented  # TODO
+        self.local2global_dofs = local2global_dofs
 
 
-class SpaceY(Space):
+class TensorProductSpaceND(TensorProductSpace):
+    mesh: TensorProductMeshND
+    basis_functions_type: BasisFunctionsNDType
+
+    space_per_direction: List[Space1D]
+    degree_per_direction: npt.NDArray[np.int_]
+    number_of_dofs_per_direction: npt.NDArray[np.int_] = np.array([])
+    number_of_dofs_per_direction_in_element: npt.NDArray[np.int_]
+
+    def __init__(self, space_per_direction: List[Space1D], tensor_product_mesh: TensorProductMeshND = None,
+                 derivatives_up_to: int = 0):
+        self.space_per_direction = space_per_direction
+        self.set_degree_per_direction()
+        if len(self.number_of_dofs_per_direction) == 0:
+            self.set_number_of_dofs_per_direction()
+        self.set_number_of_dofs_per_direction_per_element()
+        self.number_of_dofs_in_element = self.number_of_dofs_per_direction_in_element.prod()
+
+        if tensor_product_mesh is None:
+            self.set_tensor_product_mesh()
+        else:
+            self.mesh = tensor_product_mesh
+        self.number_of_dofs = self.number_of_dofs_per_direction.prod()
+
+        if not are_all_equal([space_1d.basis_functions_type for space_1d in space_per_direction]):
+            raise ValueError("The 'basis_fun_type' of all spaces in a TensorProductSpace must be the same.")
+        self.basis_functions_type = to_tensor_product_type(space_per_direction[0].basis_functions_type)
+        self.set_reference_basis_functions(derivatives_up_to=derivatives_up_to)
+        self.set_local2global_dofs()
+
+    def set_degree_per_direction(self):
+        self.degree_per_direction = np.array([space_1d.degree for space_1d in self.space_per_direction])
+
+    def set_number_of_dofs_per_direction(self):
+        self.number_of_dofs_per_direction = np.array([space_1d.number_of_dofs
+                                                      for space_1d in self.space_per_direction])
+
+    def set_number_of_dofs_per_direction_per_element(self):
+        self.number_of_dofs_per_direction_in_element = np.array([space_1d.number_of_dofs_in_element
+                                                                 for space_1d in self.space_per_direction])
+
+    def set_tensor_product_mesh(self):
+        mesh_per_direction = [space_1d.mesh for space_1d in self.space_per_direction]
+        self.mesh = TensorProductMeshND(mesh_per_direction=mesh_per_direction)
+
+    def set_reference_basis_functions(self, derivatives_up_to: int = 0):
+        basis_functions_class = globals()[self.basis_functions_type.value]
+        basis_functions = basis_functions_class(degree_per_direction=self.degree_per_direction)
+
+        self.reference_basis_functions = basis_functions.evaluate(
+            evaluation_points=self.mesh.quadrature_formula.reference_quadrature_nodes,
+            derivatives_up_to=derivatives_up_to
+        )
+
+    """def set_local2global_dofs(self):
+        local2global_dofs = np.empty((self.mesh.nel, self.number_of_dofs_in_element), dtype=int)
+
+        elements_ids_per_direction = np.array(np.unravel_index(np.arange(self.mesh.nel), self.mesh.nel_dir)).T
+        number_of_dofs_per_direction_cumprod = np.cumprod(np.append(1, self.number_of_dofs_per_direction))
+        for element_global_id in range(self.mesh.nel):
+            element_ids = elements_ids_per_direction[element_global_id]
+            dofs_dir_of_el = [self.space_per_direction[direction].local2global_dofs[element_ids[direction], :]
+                              for direction in range(self.mesh.dim)]
+            global_dofs_per_dir = [dofs_dir_of_el[direction] * number_of_dofs_per_direction_cumprod[direction]
+                                   for direction in range(self.mesh.dim)]
+            l2g = global_dofs_per_dir[0]
+            if self.mesh.dim > 1:
+                l2g = l2g[:, np.newaxis] + global_dofs_per_dir[1].T
+                l2g = np.ravel(l2g)
+                if self.mesh.dim > 2:
+                    l2g = l2g[:, np.newaxis] + global_dofs_per_dir[2].T
+                    l2g = np.ravel(l2g)
+            local2global_dofs[element_global_id, :] = np.sort(l2g)
+
+        self.local2global = local2global_dofs"""
+
+    def set_local2global_dofs(self):
+        local2global_dofs = np.empty((self.mesh.number_of_elements, self.number_of_dofs_in_element), dtype=int)
+
+        grid_ids_of_all_elements = np.array(np.unravel_index(np.arange(self.mesh.number_of_elements),
+                                                             self.mesh.number_of_elements_per_direction)).T
+        number_of_dofs_per_direction_cumprod = np.cumprod(np.append(1, self.number_of_dofs_per_direction))
+
+        for global_element_id in range(self.mesh.number_of_elements):
+            element_grid_ids = grid_ids_of_all_elements[global_element_id]
+            global_grid_dofs_in_element = \
+                [self.space_per_direction[direction].local2global_dofs[element_grid_ids[direction], :]
+                 for direction in range(self.mesh.dimension)]
+
+            translated_global_grid_dofs_in_element = [global_grid_dofs_in_element[direction]
+                                                      * number_of_dofs_per_direction_cumprod[direction]
+                                                      for direction in range(self.mesh.dimension)]
+
+            local2global_in_element = translated_global_grid_dofs_in_element[0]
+            for direction in range(1, self.mesh.dimension):
+                local2global_in_element = np.add.outer(local2global_in_element,
+                                                       translated_global_grid_dofs_in_element[direction]).ravel()
+            local2global_dofs[global_element_id, :] = np.sort(local2global_in_element)
+
+        self.local2global_dofs = local2global_dofs
+
+
+class SpaceY(Space1D):
     mesh: MeshY
+    reference_basis_functions_for_element0: FunctionEvaluation
 
-    shape_fun_jacobi: npt.NDArray[np.float_]
-    shape_der_jacobi: npt.NDArray[np.float_]
-    shape_hess_jacobi: npt.NDArray[np.float_]
+    def __init__(self, mesh: MeshY, degree: int, derivatives_up_to: int = 0,
+                 basis_functions_type: BasisFunctions1DType = BasisFunctions1DType.INTEGRATED_LEGENDRE_POLYNOMIALS):
+        super().__init__(mesh=mesh, degree=degree, derivatives_up_to=derivatives_up_to,
+                         basis_functions_type=basis_functions_type)
+        self.set_reference_basis_functions_for_element0(derivatives_up_to=derivatives_up_to)
 
-    def __init__(self, mesh: MeshY, deg: int = 1, derivatives: tuple[bool, bool, bool] = (True, False, False),
-                 shape_fun_type: str = "IntegratedLegendrePolynomials"):
-        Space.__init__(self, mesh=mesh, deg=deg, derivatives=derivatives, shape_fun_type=shape_fun_type)
-        self.__compute_shape_fun_jacobi(derivatives)
+    def set_reference_basis_functions_for_element0(self, derivatives_up_to: int = 0):
+        basis_functions_class = globals()[self.basis_functions_type.value]
+        basis_functions = basis_functions_class(degree=self.degree)
 
-    def __compute_shape_fun_jacobi(self, derivatives: tuple[bool, bool, bool] = (True, False, False)):
-        basis_fun = IntegratedLegendrePolynomials(deg=self.deg, derivatives=derivatives)
-        reference_basis_fun_jacobi = basis_fun.evaluate(self.mesh.param_gauss_jacobi_nodes)
-        self.shape_fun_jacobi = reference_basis_fun_jacobi["fun"]
-        self.shape_der_jacobi = reference_basis_fun_jacobi["der"]
-        self.shape_hess_jacobi = reference_basis_fun_jacobi["hess"]
+        self.reference_basis_functions_for_element0 = basis_functions.evaluate(
+            evaluation_points=self.mesh.quadrature_formula_element0.reference_quadrature_nodes,
+            derivatives_up_to=derivatives_up_to
+        )
+
+
+class ExtendedTensorProductSpace(TensorProductSpaceND):
+    space_x: TensorProductSpace
+    space_y: Space1D
+
+    mesh: ExtendedTensorProductMesh
+
+    def __init__(self, space_x: TensorProductSpace, space_y: Space1D, derivatives_up_to: int = 0):
+        space_per_direction = []
+        if isinstance(space_x, Space1D):
+            space_per_direction = [space_x, space_y]
+        elif isinstance(space_x, TensorProductSpaceND):
+            space_per_direction = space_x.space_per_direction + [space_y]
+        super().__init__(space_per_direction=space_per_direction, derivatives_up_to=derivatives_up_to)
