@@ -1,2 +1,2 @@
 # sfl
-Spectral fractional Laplacian implemented with the Caffarelli-Silvestre extension
+Spectral fractional Laplacian. FEM implementation using the Caffarelli-Silvestre extension.
